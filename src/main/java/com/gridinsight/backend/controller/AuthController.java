@@ -1,13 +1,15 @@
-// file: src/main/java/com/gridinsight/backend/controller/AuthController.java
 package com.gridinsight.backend.controller;
 
 import com.gridinsight.backend.dto.AuthResponse;
 import com.gridinsight.backend.dto.LoginRequest;
 import com.gridinsight.backend.dto.RefreshRequest;
+import com.gridinsight.backend.dto.RegisterRequest;
 import com.gridinsight.backend.service.AuthService;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.UUID;
@@ -17,9 +19,16 @@ import java.util.UUID;
 public class AuthController {
 
     private final AuthService authService;
-    public AuthController(AuthService authService) { this.authService = authService; }
 
-    // Keep your /register as-is
+    public AuthController(AuthService authService) {
+        this.authService = authService;
+    }
+
+    @PostMapping("/register")
+    public ResponseEntity<Void> register(@Valid @RequestBody RegisterRequest req) {
+        authService.register(req);
+        return ResponseEntity.status(HttpStatus.CREATED).build();
+    }
 
     @PostMapping("/login")
     public ResponseEntity<AuthResponse> login(@Valid @RequestBody LoginRequest req, HttpServletRequest http) {
@@ -42,7 +51,6 @@ public class AuthController {
         var auth = org.springframework.security.core.context.SecurityContextHolder
                 .getContext().getAuthentication();
 
-        // Principal set in JwtAuthFilter as String.valueOf(Long userId)
         Long userId = Long.valueOf((String) auth.getPrincipal());
 
         authService.logout(

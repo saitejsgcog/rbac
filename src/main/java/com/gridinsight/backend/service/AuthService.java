@@ -3,20 +3,16 @@ package com.gridinsight.backend.service;
 import com.gridinsight.backend.dto.AuthResponse;
 import com.gridinsight.backend.dto.LoginRequest;
 import com.gridinsight.backend.dto.RefreshRequest;
-import com.gridinsight.backend.entity.AuthAuditLog;
-import com.gridinsight.backend.entity.AuthEventType;
-import com.gridinsight.backend.entity.RefreshToken;
-import com.gridinsight.backend.entity.UserSession;
-import com.gridinsight.backend.repository.AuthAuditLogRepository;
-import com.gridinsight.backend.repository.RefreshTokenRepository;
-import com.gridinsight.backend.repository.UserRepository;
-import com.gridinsight.backend.repository.UserSessionRepository;
+import com.gridinsight.backend.dto.RegisterRequest;
+import com.gridinsight.backend.entity.*;
+import com.gridinsight.backend.repository.*;
 import com.gridinsight.backend.security.JwtService;
 import org.springframework.security.authentication.AuthenticationManager;
 import org.springframework.security.authentication.BadCredentialsException;
 import org.springframework.security.authentication.LockedException;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.AuthenticationException;
+import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -24,8 +20,10 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.LocalDateTime;
 import java.util.List;
-import java.util.Objects;
+import java.util.NoSuchElementException;
 import java.util.UUID;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 @Service
 public class AuthService {
@@ -40,16 +38,43 @@ public class AuthService {
     private final AuthAuditLogRepository auditRepo;
     private final AuthenticationManager authManager;
     private final JwtService jwtService;
+    private final RoleRepository roleRepo;
+    private final PasswordEncoder passwordEncoder;
 
     public AuthService(UserRepository userRepo, UserSessionRepository sessionRepo,
                        RefreshTokenRepository refreshRepo, AuthAuditLogRepository auditRepo,
-                       AuthenticationManager authManager, JwtService jwtService) {
+                       AuthenticationManager authManager, JwtService jwtService,
+                       RoleRepository roleRepo, PasswordEncoder passwordEncoder) {
         this.userRepo = userRepo;
         this.sessionRepo = sessionRepo;
         this.refreshRepo = refreshRepo;
         this.auditRepo = auditRepo;
         this.authManager = authManager;
         this.jwtService = jwtService;
+        this.roleRepo = roleRepo;
+        this.passwordEncoder = passwordEncoder;
+    }
+
+    @Transactional
+    public void register(RegisterRequest req) {
+        if (userRepo.findByEmailIgnoreCase(req.getEmail()).isPresent()) {
+            throw new IllegalStateException("Email already in use");
+        }
+
+        User user = new User();
+        user.setName(req.getName());
+        user.setEmail(req.getEmail());
+        user.setPhone(req.getPhone());
+        user.setPasswordHash(passwordEncoder.encode(req.getPassword()));
+        user.setStatus(UserStatus.ACTIVE);
+
+        // Force ADMIN role for now so you can test US001
+        Role adminRole = roleRepo.findByName(RoleName.ADMIN)
+                .orElseThrow(() -> new IllegalStateException("ADMIN role not found in DB"));
+
+        user.getRoles().add(adminRole);
+
+        userRepo.save(user);
     }
 
     @Transactional
@@ -64,7 +89,6 @@ public class AuthService {
         }
 
         try {
-            // Authenticate by email (AppUserDetailsService uses email as username)
             authManager.authenticate(new UsernamePasswordAuthenticationToken(user.getEmail(), request.password()));
         } catch (AuthenticationException ex) {
             int attempts = user.getFailedLoginAttempts() + 1;
@@ -84,7 +108,7 @@ public class AuthService {
         user.setLockedUntil(null);
         userRepo.save(user);
 
-        // Create session (UUID id, Long userId)
+        // Create session
         UUID sessionId = UUID.randomUUID();
         var session = new UserSession();
         session.setId(sessionId);
@@ -94,13 +118,14 @@ public class AuthService {
         session.setRevoked(false);
         sessionRepo.save(session);
 
-        // Roles (empty list for now; add mapping later if needed)
-        List<String> roles = List.of();
+        // Access token
+        List<String> roles = user.getRoles().stream()
+                .map(r -> r.getName().name())
+                .collect(Collectors.toList());
 
-        // Access token (JwtService accepts Long userId)
         String access = jwtService.generateAccessToken(user.getId(), sessionId, roles);
 
-        // Refresh token (opaque, rotated on refresh)
+        // Refresh token
         var refreshPlain = UUID.randomUUID().toString() + "." + UUID.randomUUID();
         var refresh = new RefreshToken();
         refresh.setId(UUID.randomUUID());
@@ -128,17 +153,12 @@ public class AuthService {
         var hash = sha256(request.refreshToken());
         var rt = refreshRepo.findByTokenHash(hash).orElseThrow(() -> new BadCredentialsException("INVALID_REFRESH"));
 
-        // Reuse/expired detection
         if (rt.isRevoked() || LocalDateTime.now().isAfter(rt.getExpiresAt())) {
             audit(rt.getUserId(), AuthEventType.REFRESH_REUSE_DETECTED, "Reuse/Expired", ip, userAgent);
-            // revoke entire session & all remaining refresh tokens
             sessionRepo.findById(rt.getSessionId()).ifPresent(s -> { s.setRevoked(true); sessionRepo.save(s); });
-            refreshRepo.findBySessionIdAndRevokedFalse(rt.getSessionId())
-                    .forEach(t -> { t.setRevoked(true); refreshRepo.save(t); });
             throw new BadCredentialsException("INVALID_REFRESH");
         }
 
-        // Rotate the refresh token
         rt.setRevoked(true);
         rt.setRotatedAt(LocalDateTime.now());
         refreshRepo.save(rt);
@@ -155,18 +175,12 @@ public class AuthService {
         newRt.setRevoked(false);
         refreshRepo.save(newRt);
 
-        // Update session activity
-        var session = sessionRepo.findById(rt.getSessionId())
-                .orElseThrow(() -> new BadCredentialsException("SESSION_NOT_FOUND"));
-        if (session.isRevoked()) {
-            throw new BadCredentialsException("SESSION_REVOKED");
-        }
+        var session = sessionRepo.findById(rt.getSessionId()).orElseThrow();
         session.setLastActivity(LocalDateTime.now());
         sessionRepo.save(session);
 
-        // Re-issue access (roles could be reloaded if you add RBAC later)
         var user = userRepo.findById(rt.getUserId()).orElseThrow();
-        List<String> roles = List.of();
+        List<String> roles = user.getRoles().stream().map(r -> r.getName().name()).collect(Collectors.toList());
         String access = jwtService.generateAccessToken(user.getId(), session.getId(), roles);
 
         audit(user.getId(), AuthEventType.REFRESH_SUCCESS, "Rotated", ip, userAgent);
@@ -183,23 +197,14 @@ public class AuthService {
     @Transactional
     public void logout(UUID sessionId, Long userId, boolean allDevices, String ip, String userAgent) {
         if (allDevices) {
-            // Revoke all active sessions for this user
             sessionRepo.findByUserIdAndRevokedFalse(userId).forEach(s -> {
                 s.setRevoked(true);
                 sessionRepo.save(s);
             });
-            // Revoke all refresh tokens for those sessions (defensive)
-            sessionRepo.findByUserIdAndRevokedFalse(userId).forEach(s ->
-                    refreshRepo.findBySessionIdAndRevokedFalse(s.getId())
-                            .forEach(t -> { t.setRevoked(true); refreshRepo.save(t); })
-            );
         } else {
             sessionRepo.findById(sessionId).ifPresent(s -> {
                 s.setRevoked(true);
                 sessionRepo.save(s);
-                // Revoke refresh tokens tied to this session
-                refreshRepo.findBySessionIdAndRevokedFalse(s.getId())
-                        .forEach(t -> { t.setRevoked(true); refreshRepo.save(t); });
             });
         }
         audit(userId, AuthEventType.LOGOUT, allDevices ? "ALL_DEVICES" : "SINGLE_SESSION", ip, userAgent);
