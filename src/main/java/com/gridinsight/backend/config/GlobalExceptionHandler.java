@@ -30,8 +30,11 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(Exception.class)
     public ResponseEntity<?> handleUnknown(Exception ex) {
+        ex.printStackTrace();
         return ResponseEntity.internalServerError().body(new ApiError("INTERNAL_ERROR", List.of("Unexpected error")));
     }
+
+
 
     record ApiError(String code, List<String> messages) {}
 }

@@ -6,6 +6,8 @@ import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.type.SqlTypes;
 
 import java.time.LocalDateTime;
+import java.util.HashSet;
+import java.util.Set;
 
 @Entity
 @Table(name = "users")
@@ -32,10 +34,19 @@ public class User {
     @Column(nullable = false, length = 20)
     private UserStatus status;
 
-    // 🔒 Add these for lockout policy
     @Column(name = "failed_login_attempts", nullable = false)
     private int failedLoginAttempts = 0;
 
     @Column(name = "locked_until")
-    private LocalDateTime lockedUntil; // null = not locked
+    private LocalDateTime lockedUntil;
+
+    // --- NEW CODE START ---
+    @ManyToMany(fetch = FetchType.EAGER)
+    @JoinTable(
+            name = "user_roles",
+            joinColumns = @JoinColumn(name = "user_id"),
+            inverseJoinColumns = @JoinColumn(name = "role_id")
+    )
+    private Set<Role> roles = new HashSet<>();
+    // --- NEW CODE END ---
 }
